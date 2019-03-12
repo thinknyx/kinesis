@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: LambdaTV S3 event log setup
+
+Resources:
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: InvokePermission
+    Properties:
+      BucketName: !Sub 'lambdatv-s3-event-log-${AWS::AccountId}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+        -  Event: 's3:ObjectCreated:*'
+           Function: !Sub '${CatchAllFn.Arn}'
+        -  Event: 's3:ObjectRemoved:*'
+           Function: !Sub '${CatchAllFn.Arn}'
+        -  Event: 's3:ReducedRedundancyLostObject'
+           Function: !Sub '${CatchAllFn.Arn}'
+
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      KeySchema:
+      - AttributeName: RequestId
+        KeyType: HASH
+      AttributeDefinitions:
+      -  AttributeName: RequestId
+         AttributeType: S
+
+  CatchAllFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          from uuid import uuid4
+
+          dynamodb = boto3.resource('dynamodb')
+
+
+          def image_handler(event, context):
+              for record in event['Records']:
+                  bucket_name = record['s3']['bucket']['name']
+                  object_key = record['s3']['object']['key']
+                  size = record['s3']['object'].get('size', -1)
+                  event_name = record['eventName']
+                  event_time = record['eventTime']
+                  dynamodb.Table('${Table}').put_item(
+                      Item={'RequestId': str(uuid4()), 'Bucket': bucket_name, 'Object': object_key,
+                            'Size': size, 'Event': event_name, 'EventTime': event_time})
+
+
+      Handler: index.image_handler
+      Runtime: python3.6
+      Role: !Sub '${Role.Arn}'
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CatchAllFn
+      Action: 'lambda:InvokeFunction'
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::lambdatv-s3-event-log-${AWS::AccountId}'
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [lambda.amazonaws.com]
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+      - PolicyName: tag
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action: ['dynamodb:PutItem']
+            Resource: !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${Table}'
